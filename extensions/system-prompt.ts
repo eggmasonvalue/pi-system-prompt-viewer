@@ -17,7 +17,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-const CHROME_ROWS = 6;
+const CHROME_ROWS = 7;
 
 export default function systemPromptViewer(pi: ExtensionAPI) {
   let lastPrompt: string | undefined;
@@ -35,13 +35,15 @@ export default function systemPromptViewer(pi: ExtensionAPI) {
       }
 
       await ctx.waitForIdle();
+      const fromLastRun = lastPrompt !== undefined;
       const prompt = lastPrompt ?? ctx.getSystemPrompt();
       const active = new Set(pi.getActiveTools());
       const tools = pi.getAllTools().filter((tool) => active.has(tool.name));
       const text = `${prompt}\n\n${JSON.stringify(tools, null, 2)}`;
+      const stats = `${countLines(prompt)} lines, ${prompt.length.toLocaleString()} chars | ${tools.length} tools | ${fromLastRun ? "last run" : "base prompt"}`;
 
       await ctx.ui.custom<void>(
-        (tui, theme, _keybindings, done) => new SystemPromptViewer(tui, theme, text, done),
+        (tui, theme, _keybindings, done) => new SystemPromptViewer(tui, theme, text, stats, done),
         {
           overlay: true,
           overlayOptions: {
@@ -67,6 +69,7 @@ class SystemPromptViewer {
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly text: string,
+    private readonly stats: string,
     private readonly done: () => void,
   ) {
     this.lines = text.split("\n");
@@ -113,6 +116,7 @@ class SystemPromptViewer {
     const row = (content: string) => `${border("│")}${pad(content, innerWidth)}${border("│")}`;
     const output = [border(`╭${"─".repeat(innerWidth)}╮`)];
     output.push(row(` ${this.theme.fg("accent", this.theme.bold("System Prompt"))}`));
+    output.push(row(` ${this.theme.fg("dim", this.stats)}`));
     output.push(row(""));
 
     const end = Math.min(this.scrollOffset + visible, displayLines.length);
@@ -159,6 +163,10 @@ class SystemPromptViewer {
     clearTimeout(this.copiedTimer);
     this.copiedTimer = undefined;
   }
+}
+
+function countLines(text: string): number {
+  return text.length === 0 ? 0 : text.split("\n").length;
 }
 
 function pad(text: string, width: number): string {
