@@ -1,6 +1,6 @@
 # pi-system-prompt-viewer
 
-Display the assembled [Pi](https://pi.dev) system prompt and active tool schemas in a scrollable overlay.
+Display what sits above the first user message in a scrollable overlay: the assembled [Pi](https://pi.dev) system prompt plus the tool definitions sent with it.
 
 The command snapshots the prompt on `agent_start`, after other extensions have rewritten it. Opening it before the first agent run shows the base prompt.
 

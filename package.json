@@ -2,7 +2,7 @@
   "name": "pi-system-prompt-viewer",
   "version": "1.0.0",
   "private": false,
-  "description": "Show the assembled Pi system prompt and active tool schemas in a scrollable overlay",
+  "description": "Show the assembled Pi system prompt and the tool definitions sent with it",
   "keywords": [
     "pi-package",
     "pi-extension",
