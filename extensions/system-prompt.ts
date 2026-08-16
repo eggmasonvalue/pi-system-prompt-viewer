@@ -1,5 +1,5 @@
 /**
- * /system-prompt — show the assembled system prompt and active tool schemas.
+ * /system-prompt — show the assembled system prompt and active tool objects.
  *
  * Snapshots the prompt on agent_start, after other before_agent_start handlers
  * have rewritten it. The command handler would only see the base prompt,
@@ -9,7 +9,6 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   Theme,
-  ToolInfo,
 } from "@earendil-works/pi-coding-agent";
 import {
   matchesKey,
@@ -18,7 +17,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-const CHROME_ROWS = 7;
+const CHROME_ROWS = 6;
 
 export default function systemPromptViewer(pi: ExtensionAPI) {
   let lastPrompt: string | undefined;
@@ -37,33 +36,12 @@ export default function systemPromptViewer(pi: ExtensionAPI) {
 
       await ctx.waitForIdle();
       const prompt = lastPrompt ?? ctx.getSystemPrompt();
-      const promptSource = lastPrompt
-        ? "final prompt from the last agent run"
-        : "base prompt; no agent run yet";
       const active = new Set(pi.getActiveTools());
-      const activeTools = pi.getAllTools().filter((tool) => active.has(tool.name));
-      const promptLines = prompt.split("\n");
-      const schemaLines = formatToolSchemas(activeTools);
-      const lines = [
-        ...promptLines,
-        "",
-        "────────────────────────────────────────",
-        "",
-        ...schemaLines,
-      ];
+      const tools = pi.getAllTools().filter((tool) => active.has(tool.name));
+      const text = `${prompt}\n\n${JSON.stringify(tools, null, 2)}`;
 
       await ctx.ui.custom<void>(
-        (tui, theme, _keybindings, done) =>
-          new SystemPromptViewer(
-            tui,
-            theme,
-            lines,
-            promptLines.length,
-            prompt.length,
-            activeTools.length,
-            promptSource,
-            done,
-          ),
+        (tui, theme, _keybindings, done) => new SystemPromptViewer(tui, theme, text, done),
         {
           overlay: true,
           overlayOptions: {
@@ -78,69 +56,20 @@ export default function systemPromptViewer(pi: ExtensionAPI) {
   });
 }
 
-function formatToolSchemas(tools: ToolInfo[]): string[] {
-  if (tools.length === 0) return ["Tool definitions (0 tools)", "", "No tools."];
-
-  const lines = [
-    `Tool definitions (${tools.length} tools)`,
-    "",
-  ];
-  for (const tool of tools) {
-    lines.push(`name: ${tool.name}`);
-    lines.push(`  description: ${tool.description}`);
-    lines.push(`  source: ${formatSource(tool.sourceInfo.source)}`);
-    lines.push("  parameters:");
-    for (const line of (JSON.stringify(tool.parameters, null, 2) ?? "undefined").split("\n")) {
-      lines.push(`    ${line}`);
-    }
-    lines.push("");
-  }
-  return lines;
-}
-
-function formatSource(source: string): string {
-  if (source === "builtin") return "built-in";
-  if (source === "sdk") return "SDK";
-  return source;
-}
-
-interface DisplayLine {
-  text: string;
-  sourceIndex: number;
-  continuation: boolean;
-}
-
-type LineStyle = "heading" | "bullet" | "section" | "tool" | "plain";
-
-function styleFor(line: string): LineStyle {
-  if (line.startsWith("Available tools:") || line.startsWith("Guidelines:")) return "section";
-  if (line.startsWith("Tool definitions")) return "section";
-  if (line.startsWith("name:") || line.startsWith("  description:") || line.startsWith("  source:")) {
-    return "tool";
-  }
-  if (/^#+\s/.test(line)) return "heading";
-  if (line.startsWith("- ")) return "bullet";
-  return "plain";
-}
-
 class SystemPromptViewer {
   private scrollOffset = 0;
   private copiedAt = 0;
   private copiedTimer: ReturnType<typeof setTimeout> | undefined;
   private totalDisplayLines = 0;
-  private readonly fullText: string;
+  private readonly lines: string[];
 
   constructor(
     private readonly tui: TUI,
     private readonly theme: Theme,
-    private readonly lines: string[],
-    private readonly promptLineCount: number,
-    private readonly promptCharCount: number,
-    private readonly toolCount: number,
-    private readonly promptSource: string,
+    private readonly text: string,
     private readonly done: () => void,
   ) {
-    this.fullText = lines.join("\n");
+    this.lines = text.split("\n");
   }
 
   handleInput(data: string): void {
@@ -181,32 +110,20 @@ class SystemPromptViewer {
     this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, displayLines.length - visible));
 
     const border = (text: string) => this.theme.fg("border", text);
-    const row = (content: string) =>
-      `${border("│")}${pad(content, innerWidth)}${border("│")}`;
+    const row = (content: string) => `${border("│")}${pad(content, innerWidth)}${border("│")}`;
     const output = [border(`╭${"─".repeat(innerWidth)}╮`)];
-    const title = this.theme.fg("accent", this.theme.bold("System Prompt"));
-    const metadata = this.theme.fg(
-      "dim",
-      `— ${this.promptLineCount} lines, ${this.promptCharCount.toLocaleString()} chars | ${this.toolCount} tools`,
-    );
-    output.push(row(` ${title}  ${metadata}`));
-    output.push(row(` ${this.theme.fg("dim", this.promptSource)}`));
+    output.push(row(` ${this.theme.fg("accent", this.theme.bold("System Prompt"))}`));
     output.push(row(""));
 
     const end = Math.min(this.scrollOffset + visible, displayLines.length);
     for (let index = this.scrollOffset; index < end; index++) {
-      const displayLine = displayLines[index]!;
-      const style = styleFor(this.lines[displayLine.sourceIndex]!);
-      output.push(row(` ${styleLine(this.theme, displayLine.text, style, displayLine.continuation)}`));
+      output.push(row(` ${displayLines[index]!}`));
     }
     for (let index = end - this.scrollOffset; index < visible; index++) output.push(row(""));
 
     const range = `${this.scrollOffset + 1}-${end}/${displayLines.length}`;
-    const percent = displayLines.length
-      ? Math.round((this.scrollOffset / Math.max(1, displayLines.length - visible)) * 100)
-      : 0;
     const copied = Date.now() - this.copiedAt < 2_000 ? this.theme.fg("success", "copied") : "copy";
-    const footerLeft = this.theme.fg("dim", `${range} (${percent}%)`);
+    const footerLeft = this.theme.fg("dim", range);
     const footerRight = this.theme.fg("dim", `c ${copied}  ↑↓/jk pgup/pgdn home/end  Esc/q`);
     const spacing = Math.max(1, innerWidth - 1 - visibleWidth(footerLeft) - visibleWidth(footerRight));
     output.push(row(""));
@@ -221,19 +138,17 @@ class SystemPromptViewer {
     return Math.max(1, Math.floor(this.tui.terminal.rows * 0.92) - CHROME_ROWS);
   }
 
-  private buildDisplayLines(width: number): DisplayLine[] {
-    const displayLines: DisplayLine[] = [];
-    for (const [sourceIndex, line] of this.lines.entries()) {
+  private buildDisplayLines(width: number): string[] {
+    const displayLines: string[] = [];
+    for (const line of this.lines) {
       const wrapped = wrapTextWithAnsi(line, width);
-      for (const [index, text] of (wrapped.length ? wrapped : [""]).entries()) {
-        displayLines.push({ text, sourceIndex, continuation: index > 0 });
-      }
+      displayLines.push(...(wrapped.length ? wrapped : [""]));
     }
     return displayLines;
   }
 
   private copyToClipboard(): void {
-    const base64 = Buffer.from(this.fullText, "utf-8").toString("base64");
+    const base64 = Buffer.from(this.text, "utf-8").toString("base64");
     process.stdout.write(`\x1b]52;c;${base64}\x07`);
     this.copiedAt = Date.now();
     clearTimeout(this.copiedTimer);
@@ -248,14 +163,4 @@ class SystemPromptViewer {
 
 function pad(text: string, width: number): string {
   return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
-}
-
-function styleLine(theme: Theme, text: string, style: LineStyle, continuation: boolean): string {
-  if (continuation) {
-    return style === "bullet" ? theme.fg("muted", text) : theme.fg("dim", text);
-  }
-  if (style === "section" || style === "heading") return theme.fg("accent", theme.bold(text));
-  if (style === "bullet") return theme.fg("muted", text);
-  if (style === "tool") return theme.fg("success", text);
-  return text;
 }
