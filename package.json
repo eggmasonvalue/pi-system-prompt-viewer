@@ -2,19 +2,33 @@
   "name": "pi-system-prompt-viewer",
   "version": "1.0.0",
   "private": false,
-  "description": "Show the assembled Pi system prompt and the tool definitions sent with it",
+  "description": "Inspect and copy the assembled Pi coding agent system prompt and active tool definitions in a scrollable TUI overlay",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi-coding-agent",
+    "pi",
     "system-prompt",
+    "prompt-inspector",
+    "prompt-debugging",
+    "tool-definitions",
+    "developer-tools",
     "debugging"
   ],
   "license": "Apache-2.0",
+  "homepage": "https://github.com/eggmasonvalue/pi-system-prompt-viewer#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/eggmasonvalue/pi-system-prompt-viewer"
+    "url": "https://github.com/eggmasonvalue/pi-system-prompt-viewer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eggmasonvalue/pi-system-prompt-viewer/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
+    "assets",
     "extensions",
     "LICENSE",
     "README.md"
@@ -24,6 +38,7 @@
     "@earendil-works/pi-tui": "*"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "image": "https://raw.githubusercontent.com/eggmasonvalue/pi-system-prompt-viewer/main/assets/system-prompt-viewer.png"
   }
 }
