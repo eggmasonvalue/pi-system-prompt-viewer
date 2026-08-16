@@ -1,0 +1,29 @@
+{
+  "name": "pi-system-prompt-viewer",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Show the assembled Pi system prompt and active tool schemas in a scrollable overlay",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "system-prompt",
+    "debugging"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eggmasonvalue/pi-system-prompt-viewer"
+  },
+  "files": [
+    "extensions",
+    "LICENSE",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}
