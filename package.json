@@ -1,6 +1,6 @@
 {
   "name": "pi-system-prompt-viewer",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": false,
   "type": "module",
   "description": "Inspect Pi's provider-neutral system footprint and latest provider payload in a scrollable TUI overlay",
