@@ -2,13 +2,15 @@
   "name": "pi-system-prompt-viewer",
   "version": "1.0.0",
   "private": false,
-  "description": "Inspect and copy the assembled Pi coding agent system prompt and active tool definitions in a scrollable TUI overlay",
+  "type": "module",
+  "description": "Inspect Pi's provider-neutral system footprint and latest provider payload in a scrollable TUI overlay",
   "keywords": [
     "pi-package",
     "pi-extension",
     "pi-coding-agent",
     "pi",
     "system-prompt",
+    "system-context",
     "prompt-inspector",
     "prompt-debugging",
     "tool-definitions",
@@ -27,9 +29,13 @@
   "publishConfig": {
     "access": "public"
   },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/footprint-model.test.ts"
+  },
   "files": [
     "assets",
     "extensions",
+    "lib",
     "LICENSE",
     "README.md"
   ],
@@ -38,7 +44,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "pi": {
-    "extensions": ["./extensions"],
-    "image": "https://raw.githubusercontent.com/eggmasonvalue/pi-system-prompt-viewer/main/assets/system-prompt-viewer.png"
+    "extensions": [
+      "./extensions"
+    ],
+    "image": "https://raw.githubusercontent.com/eggmasonvalue/pi-system-prompt-viewer/main/assets/system-footprint.png"
   }
 }
