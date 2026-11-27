@@ -1,6 +1,6 @@
 {
   "name": "pi-system-prompt-viewer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": false,
   "type": "module",
   "description": "Inspect Pi's provider-neutral system footprint and latest provider payload in a scrollable TUI overlay",
@@ -40,6 +40,7 @@
     "README.md"
   ],
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },

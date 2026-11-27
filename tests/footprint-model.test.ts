@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  filterVisibleTools,
+  findSearchMatches,
+  findSectionLines,
+  PROVIDER_DIAGNOSTICS_HEADINGS,
+  parseViewerCommandMode,
+  redactHeaders,
+  renderProviderDiagnostics,
   renderProviderNeutralContent,
   renderStructured,
+  SYSTEM_SECTION_HEADINGS,
   serializeProviderPayload,
   toProviderNeutralTool,
   type ProviderNeutralToolInput,
@@ -94,6 +102,22 @@ test("tool projection excludes ToolInfo internals and preserves schemas", () => 
   assert.equal(JSON.stringify(descriptor).includes("promptGuidelines"), false);
 });
 
+test("tool projection preserves constrainedSampling when present", () => {
+  const descriptor = toProviderNeutralTool({
+    name: "structured",
+    description: "Structured tool",
+    parameters: { type: "object" },
+    constrainedSampling: { strict: true },
+  });
+
+  assert.deepEqual(descriptor, {
+    name: "structured",
+    description: "Structured tool",
+    parameters: { type: "object" },
+    constrainedSampling: { strict: true },
+  });
+});
+
 test("display and provider JSON copy preserve duplicate actual content", () => {
   const payload = {
     system: "repeat\nrepeat",
@@ -108,4 +132,118 @@ test("display and provider JSON copy preserve duplicate actual content", () => {
   assert.equal((display.match(/repeat/g) ?? []).length, 4);
   assert.deepEqual(JSON.parse(copy), payload);
   assert.equal((copy.match(/repeat/g) ?? []).length, 4);
+});
+
+test("renderStructured handles circular references while keeping shared non-cyclic values", () => {
+  const shared = { id: "shared" };
+  const cyclic: Record<string, unknown> = { first: shared, second: shared };
+  cyclic.self = cyclic;
+
+  const display = renderStructured(cyclic);
+  assert.equal((display.match(/"shared"/g) ?? []).length, 2);
+  assert.ok(display.includes('"[Circular]"'));
+});
+
+test("filterVisibleTools excludes hidden loadout declarations in order", () => {
+  const tools = [
+    { name: "read" },
+    { name: "bash" },
+    { name: "codemode" },
+    { name: "edit" },
+  ];
+  assert.deepEqual(filterVisibleTools(tools, ["read", "edit"]), [
+    { name: "bash" },
+    { name: "codemode" },
+  ]);
+  assert.deepEqual(filterVisibleTools(tools, undefined), tools);
+});
+
+test("redactHeaders redacts sensitive headers, drops null entries, and preserves safe metadata", () => {
+  const redacted = redactHeaders({
+    Authorization: "Bearer sk-secret",
+    "x-api-key": "ant-key-123",
+    "X-Goog-Api-Key": "goog-key",
+    Cookie: "sid=abc",
+    "Set-Cookie": "sid=def",
+    "x-custom-secret": "shh",
+    "x-auth-token": "tok",
+    "x-dropped": null,
+    "x-session-id": "sess-42",
+    "x-request-id": "req-99",
+    "anthropic-beta": "prompt-caching-2024-07-31",
+    "content-type": "application/json",
+    "retry-after": "3",
+  });
+
+  assert.deepEqual(redacted, {
+    Authorization: "[REDACTED]",
+    "x-api-key": "[REDACTED]",
+    "X-Goog-Api-Key": "[REDACTED]",
+    Cookie: "[REDACTED]",
+    "Set-Cookie": "[REDACTED]",
+    "x-custom-secret": "[REDACTED]",
+    "x-auth-token": "[REDACTED]",
+    "x-session-id": "sess-42",
+    "x-request-id": "req-99",
+    "anthropic-beta": "prompt-caching-2024-07-31",
+    "content-type": "application/json",
+    "retry-after": "3",
+  });
+});
+
+test("renderProviderDiagnostics includes headers, response status, and payload sections", () => {
+  const rendered = renderProviderDiagnostics({
+    requestHeaders: {
+      authorization: "[REDACTED]",
+      "x-session-id": "sess-1",
+    },
+    response: {
+      status: 200,
+      headers: { "x-request-id": "req-1" },
+      responseCount: 1,
+    },
+    payloadDisplay: '{\n  "model": "claude"\n}',
+  });
+
+  const lines = rendered.split("\n");
+  const sections = findSectionLines(lines, PROVIDER_DIAGNOSTICS_HEADINGS);
+  assert.equal(sections.length, 3);
+  assert.ok(rendered.includes("[REDACTED]"));
+  assert.ok(rendered.includes('"status": 200'));
+  assert.ok(rendered.includes('"model": "claude"'));
+});
+
+test("findSearchMatches finds case-insensitive matches across lines", () => {
+  const matches = findSearchMatches(
+    ["Hello world", "WORLD of world", "nothing"],
+    "world",
+  );
+  assert.deepEqual(matches, [
+    { lineIndex: 0, start: 6, end: 11 },
+    { lineIndex: 1, start: 0, end: 5 },
+    { lineIndex: 1, start: 9, end: 14 },
+  ]);
+  assert.deepEqual(findSearchMatches(["abc"], "   "), []);
+});
+
+test("findSectionLines locates only headings followed by matching horizontal rules", () => {
+  const rendered = renderProviderNeutralContent({
+    systemPrompt: "Tools\nnot a heading because no rule",
+    tools: [],
+  });
+  const lines = rendered.split("\n");
+  const indices = findSectionLines(lines, SYSTEM_SECTION_HEADINGS);
+  assert.equal(indices.length, 2);
+  assert.equal(lines[indices[0]!], "System Prompt");
+  assert.equal(lines[indices[1]!], "Tools");
+});
+
+test("parseViewerCommandMode parses empty, system, provider, and rejects unknown args", () => {
+  assert.equal(parseViewerCommandMode(""), "system");
+  assert.equal(parseViewerCommandMode("   "), "system");
+  assert.equal(parseViewerCommandMode("system"), "system");
+  assert.equal(parseViewerCommandMode("SYSTEM"), "system");
+  assert.equal(parseViewerCommandMode("provider"), "provider");
+  assert.equal(parseViewerCommandMode("  Provider "), "provider");
+  assert.equal(parseViewerCommandMode("other"), undefined);
 });
