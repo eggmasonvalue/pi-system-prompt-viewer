@@ -41,21 +41,27 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import {
+  ARRAY_COLLAPSED,
+  analyzeSystemPrompt,
+  buildStructuredTree,
+  collectMatchingFoldPaths,
+  collectSmartCollapsedPaths,
   filterVisibleTools,
   findSearchMatches,
-  findSectionLines,
+  MULTILINE_COLLAPSED,
   MULTILINE_END,
   MULTILINE_START,
-  PROVIDER_DIAGNOSTICS_HEADINGS,
+  OBJECT_COLLAPSED,
   type ProviderNeutralContent,
   type ProviderResponseSnapshot,
   parseViewerCommandMode,
   redactHeaders,
-  renderProviderDiagnostics,
   renderProviderNeutralContent,
-  renderStructured,
+  renderStructuredTree,
   type SearchMatch,
-  SYSTEM_SECTION_HEADINGS,
+  type StructuredDisplayLine,
+  type StructuredNode,
+  type SystemPromptAnalysis,
   serializeProviderPayload,
   toProviderNeutralTool,
   type ViewerMode,
@@ -71,7 +77,7 @@ interface SystemSnapshot {
 }
 
 interface ProviderSnapshot {
-  displayText: string;
+  payloadTree: StructuredNode;
   copyText: string;
   label?: string;
   requestNumber: number;
@@ -80,19 +86,45 @@ interface ProviderSnapshot {
   response?: ProviderResponseSnapshot;
 }
 
-type LineKind = "plain" | "heading" | "rule" | "delimiter" | "structured";
+type LineKind =
+  | "plain"
+  | "heading"
+  | "rule"
+  | "structured"
+  | "xml-open"
+  | "xml-close"
+  | "xml-inline"
+  | "md-heading";
 
 interface WrappedLine {
   text: string;
   kind: LineKind;
+  foldPath?: string;
+  collapsed?: boolean;
+  showFoldMarker?: boolean;
+}
+
+interface SectionTarget {
+  lineIndex: number;
+  label: string;
+  foldPath?: string;
+}
+
+interface FoldTarget {
+  lineIndex: number;
+  foldPath: string;
+  collapsed: boolean;
 }
 
 interface StyledSegment {
   text: string;
   role?:
     | "heading"
+    | "sectionTag"
     | "rule"
     | "delimiter"
+    | "fold"
+    | "foldActive"
     | "key"
     | "string"
     | "number"
@@ -109,8 +141,13 @@ interface TabBounds {
 
 const CHROME_ROWS = 8;
 const TAB_ROW_Y = 2;
+const CONTENT_START_Y = 5;
 const COPY_FEEDBACK_MS = 2_000;
 const COPY_ERROR_FEEDBACK_MS = 3_500;
+const EMPTY_COLLAPSED_SET: ReadonlySet<string> = new Set();
+
+const INLINE_OPEN_TAG_PREFIX_RE = /^<[A-Za-z][\w.:-]*(?:\s[^<>]*)?>/;
+const INLINE_CLOSE_TAG_SUFFIX_RE = /<\/[A-Za-z][\w.:-]*>\s*$/;
 
 const COMMAND_COMPLETIONS: readonly AutocompleteItem[] = [
   {
@@ -186,7 +223,7 @@ export default function systemPromptViewer(pi: ExtensionAPI) {
   pi.on("before_provider_request", (event, ctx) => {
     const requestNumber = ++providerRequestCount;
     latestProvider = {
-      displayText: renderStructured(event.payload),
+      payloadTree: buildStructuredTree(event.payload),
       copyText: serializeProviderPayload(event.payload),
       label: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
       requestNumber,
@@ -321,6 +358,15 @@ function makeFallbackSystemSnapshot(
 }
 
 class RequestFootprintViewer implements Component, Focusable {
+  private readonly tui: TUI;
+  private readonly theme: Theme;
+  private readonly keybindings: KeybindingsManager;
+  private readonly done: () => void;
+  private readonly notify: (
+    message: string,
+    type?: "info" | "warning" | "error",
+  ) => void;
+
   private _focused = false;
   private mode: ViewerMode;
   private showHeaders = false;
@@ -333,10 +379,18 @@ class RequestFootprintViewer implements Component, Focusable {
 
   private readonly systemText: string;
   private readonly systemSnapshot: SystemSnapshot;
+  private readonly systemPromptAnalysis: SystemPromptAnalysis;
+  private readonly systemToolsTree: StructuredNode;
+
   private readonly provider?: ProviderSnapshot;
-  private readonly providerPayloadDisplay: string;
-  private readonly providerDiagnosticsDisplay: string;
+  private readonly providerFallbackText: string;
   private readonly providerCopyText: string;
+  private readonly providerHeadersTree?: StructuredNode;
+
+  private collapsedPaths: Set<string>;
+  private foldVersion = 0;
+  private focusedFoldPath?: string;
+  private lastJumpedSectionIndex?: number;
 
   private readonly searchInput: Input;
   private searchEditing = false;
@@ -345,44 +399,55 @@ class RequestFootprintViewer implements Component, Focusable {
   private searchMatchesByLine = new Map<number, SearchMatch[]>();
   private currentMatchIndex = -1;
 
+  private lastContentWidth = 80;
+  private lastInnerWidth = 82;
   private cachedLinesKey = "";
   private cachedWrappedLines: WrappedLine[] = [];
-  private cachedSectionLines: number[] = [];
+  private cachedSections: SectionTarget[] = [];
+  private cachedFoldTargets: FoldTarget[] = [];
   private cachedMatchesQuery = "";
   private lastTabBounds?: TabBounds;
 
   constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
     initialMode: ViewerMode,
     systemSnapshot: SystemSnapshot,
     provider: ProviderSnapshot | undefined,
-    private readonly done: () => void,
-    private readonly notify: (
+    done: () => void,
+    notify: (
       message: string,
       type?: "info" | "warning" | "error",
     ) => void,
   ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.keybindings = keybindings;
+    this.done = done;
+    this.notify = notify;
     this.mode = initialMode;
     this.systemSnapshot = systemSnapshot;
     this.systemText = renderProviderNeutralContent(systemSnapshot.content);
+    this.systemPromptAnalysis = analyzeSystemPrompt(
+      systemSnapshot.content.systemPrompt,
+    );
+    this.systemToolsTree = buildStructuredTree(systemSnapshot.content.tools);
+
     this.provider = provider;
-    this.providerPayloadDisplay =
-      provider?.displayText ??
-      [
-        "No before_provider_request payload was captured for this run.",
-        "",
-        "Use the System Footprint view for the captured semantic system context.",
-      ].join("\n");
-    this.providerDiagnosticsDisplay = provider
-      ? renderProviderDiagnostics({
-          requestHeaders: provider.requestHeaders,
-          response: provider.response,
-          payloadDisplay: this.providerPayloadDisplay,
-        })
-      : this.providerPayloadDisplay;
-    this.providerCopyText = provider?.copyText ?? this.providerPayloadDisplay;
+    this.providerFallbackText = [
+      "No before_provider_request payload was captured for this run.",
+      "",
+      "Use the System Footprint view for the captured semantic system context.",
+    ].join("\n");
+    this.providerCopyText = provider?.copyText ?? this.providerFallbackText;
+    this.providerHeadersTree = provider?.requestHeaders
+      ? buildStructuredTree(provider.requestHeaders)
+      : undefined;
+
+    this.collapsedPaths = provider
+      ? collectSmartCollapsedPaths(provider.payloadTree)
+      : new Set<string>();
 
     this.searchInput = new Input({
       prompt: "/ ",
@@ -392,12 +457,14 @@ class RequestFootprintViewer implements Component, Focusable {
     this.searchInput.onSubmit = (value) => {
       this.searchEditing = false;
       this.syncInputFocus();
+      this.commitSearchExpansions(value);
       this.applySearchQuery(value, true);
       this.tui.requestRender();
     };
     this.searchInput.onEscape = () => {
       this.searchEditing = false;
       this.syncInputFocus();
+      this.invalidateLines();
       this.applySearchQuery("", false);
       this.tui.requestRender();
     };
@@ -438,14 +505,43 @@ class RequestFootprintViewer implements Component, Focusable {
     if (matchesKey(data, "h") && this.mode === "provider" && this.provider) {
       this.showHeaders = !this.showHeaders;
       this.scrollOffset = 0;
+      this.lastJumpedSectionIndex = undefined;
       this.invalidateLines();
       this.tui.requestRender();
       return;
     }
 
     if (matchesKey(data, "s")) {
-      this.jumpToNextSection();
+      this.jumpSection(1);
       return;
+    }
+
+    if (matchesKey(data, "shift+s")) {
+      this.jumpSection(-1);
+      return;
+    }
+
+    if (this.mode === "provider" && this.provider) {
+      if (matchesKey(data, "[")) {
+        this.stepFoldFocus(-1);
+        return;
+      }
+      if (matchesKey(data, "]")) {
+        this.stepFoldFocus(1);
+        return;
+      }
+      if (
+        this.keybindings.matches(data, "tui.select.confirm") ||
+        matchesKey(data, "enter") ||
+        matchesKey(data, "return")
+      ) {
+        this.toggleFocusedFold();
+        return;
+      }
+      if (matchesKey(data, "e")) {
+        this.toggleExpandAll();
+        return;
+      }
     }
 
     if (matchesKey(data, "/")) {
@@ -523,6 +619,8 @@ class RequestFootprintViewer implements Component, Focusable {
       return;
     }
 
+    this.lastJumpedSectionIndex = undefined;
+    this.keepFocusedFoldInViewport();
     this.tui.requestRender();
   }
 
@@ -537,24 +635,43 @@ class RequestFootprintViewer implements Component, Focusable {
       );
       const changed = next !== this.scrollOffset;
       this.scrollOffset = next;
+      if (changed) {
+        this.lastJumpedSectionIndex = undefined;
+        this.keepFocusedFoldInViewport();
+      }
       return { handled: true, render: changed };
     }
 
-    if (
-      event.type === "click" &&
-      event.button === "left" &&
-      event.y === TAB_ROW_Y &&
-      this.lastTabBounds
-    ) {
-      const { systemStart, systemEnd, providerStart, providerEnd } =
-        this.lastTabBounds;
-      if (event.x >= systemStart && event.x < systemEnd) {
-        this.switchMode("system");
-        return { handled: true, render: true };
+    if (event.type === "click" && event.button === "left") {
+      if (event.y === TAB_ROW_Y && this.lastTabBounds) {
+        const { systemStart, systemEnd, providerStart, providerEnd } =
+          this.lastTabBounds;
+        if (event.x >= systemStart && event.x < systemEnd) {
+          this.switchMode("system");
+          return { handled: true, render: true };
+        }
+        if (event.x >= providerStart && event.x < providerEnd) {
+          this.switchMode("provider");
+          return { handled: true, render: true };
+        }
       }
-      if (event.x >= providerStart && event.x < providerEnd) {
-        this.switchMode("provider");
-        return { handled: true, render: true };
+
+      if (this.mode === "provider" && this.provider) {
+        const visible = this.visibleLineCount();
+        const rowOffset = event.y - CONTENT_START_Y;
+        if (
+          rowOffset >= 0 &&
+          rowOffset < visible &&
+          event.x >= 1 &&
+          event.x <= this.lastInnerWidth
+        ) {
+          const lineIndex = this.scrollOffset + rowOffset;
+          const clickedLine = this.cachedWrappedLines[lineIndex];
+          if (clickedLine?.foldPath) {
+            this.toggleFoldPath(clickedLine.foldPath);
+            return { handled: true, render: true };
+          }
+        }
       }
     }
 
@@ -564,6 +681,8 @@ class RequestFootprintViewer implements Component, Focusable {
   render(width: number): string[] {
     const innerWidth = Math.max(1, width - 2);
     const contentWidth = Math.max(1, innerWidth - 2);
+    this.lastInnerWidth = innerWidth;
+    this.lastContentWidth = contentWidth;
     this.ensureWrappedLines(contentWidth);
 
     const visible = this.visibleLineCount();
@@ -632,8 +751,14 @@ class RequestFootprintViewer implements Component, Focusable {
       if (lineIndex < end) {
         const line = this.cachedWrappedLines[lineIndex]!;
         const lineMatches = this.searchMatchesByLine.get(lineIndex) ?? [];
+        const isFocusedFold =
+          this.mode === "provider" &&
+          line.showFoldMarker === true &&
+          line.foldPath !== undefined &&
+          line.foldPath === this.focusedFoldPath;
         const rendered = renderStyledLine(
           line,
+          isFocusedFold,
           lineMatches,
           activeMatch,
           this.theme,
@@ -664,6 +789,10 @@ class RequestFootprintViewer implements Component, Focusable {
     if (this.mode === nextMode) return;
     this.mode = nextMode;
     this.scrollOffset = 0;
+    this.lastJumpedSectionIndex = undefined;
+    if (nextMode === "provider" && this.searchQuery.trim()) {
+      this.commitSearchExpansions(this.searchQuery);
+    }
     this.invalidateLines();
     this.tui.requestRender();
   }
@@ -677,36 +806,84 @@ class RequestFootprintViewer implements Component, Focusable {
     this.cachedMatchesQuery = "";
   }
 
-  private activeDisplayText(): string {
-    if (this.mode === "system") return this.systemText;
-    return this.showHeaders
-      ? this.providerDiagnosticsDisplay
-      : this.providerPayloadDisplay;
+  private effectiveCollapsedPaths(): ReadonlySet<string> {
+    if (
+      !this.provider ||
+      !this.searchEditing ||
+      !this.searchQuery.trim() ||
+      this.collapsedPaths.size === 0
+    ) {
+      return this.collapsedPaths;
+    }
+
+    const autoExpanded = collectMatchingFoldPaths(
+      this.provider.payloadTree,
+      this.searchQuery,
+    );
+    if (autoExpanded.size === 0) return this.collapsedPaths;
+
+    const merged = new Set(this.collapsedPaths);
+    for (const path of autoExpanded) {
+      merged.delete(path);
+    }
+    return merged;
   }
 
-  private activeSectionHeadings(): readonly string[] {
-    if (this.mode === "system") return SYSTEM_SECTION_HEADINGS;
-    return this.showHeaders ? PROVIDER_DIAGNOSTICS_HEADINGS : [];
+  private commitSearchExpansions(query: string): void {
+    if (!this.provider || !query.trim() || this.collapsedPaths.size === 0) {
+      return;
+    }
+    const matchingPaths = collectMatchingFoldPaths(
+      this.provider.payloadTree,
+      query,
+    );
+    let changed = false;
+    for (const path of matchingPaths) {
+      if (this.collapsedPaths.delete(path)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.foldVersion++;
+      this.invalidateLines();
+    }
   }
 
   private ensureWrappedLines(contentWidth: number): void {
-    const key = `${this.mode}:${this.showHeaders ? 1 : 0}:${contentWidth}`;
+    const liveSearchFoldKey =
+      this.mode === "provider" && this.searchEditing ? this.searchQuery : "";
+    const key =
+      this.mode === "system"
+        ? `system:${contentWidth}`
+        : `provider:${this.showHeaders ? 1 : 0}:${this.foldVersion}:${liveSearchFoldKey}:${contentWidth}`;
+
     if (this.cachedLinesKey !== key) {
-      const text = this.activeDisplayText();
-      const headings = this.activeSectionHeadings();
-      const structuredMode = this.mode === "provider";
-      this.cachedWrappedLines = wrapDocument(
-        text,
-        contentWidth,
-        headings,
-        structuredMode,
-      );
-      this.cachedSectionLines = findSectionLines(
-        this.cachedWrappedLines.map((line) => line.text),
-        headings,
-      );
+      const built =
+        this.mode === "system"
+          ? buildSystemDocument(
+              this.systemSnapshot.content.systemPrompt,
+              this.systemPromptAnalysis,
+              this.systemToolsTree,
+              contentWidth,
+            )
+          : buildProviderDocument(
+              this.provider,
+              this.providerHeadersTree,
+              this.providerFallbackText,
+              this.showHeaders,
+              this.effectiveCollapsedPaths(),
+              contentWidth,
+            );
+
+      this.cachedWrappedLines = built.lines;
+      this.cachedSections = built.sections;
+      this.cachedFoldTargets = built.foldTargets;
       this.cachedLinesKey = key;
       this.cachedMatchesQuery = "";
+
+      if (this.mode === "provider") {
+        this.ensureValidFocusedFold();
+      }
     }
 
     if (this.cachedMatchesQuery !== this.searchQuery) {
@@ -714,8 +891,178 @@ class RequestFootprintViewer implements Component, Focusable {
     }
   }
 
+  private ensureValidFocusedFold(): void {
+    if (this.cachedFoldTargets.length === 0) {
+      this.focusedFoldPath = undefined;
+      return;
+    }
+    if (
+      this.focusedFoldPath &&
+      this.cachedFoldTargets.some((t) => t.foldPath === this.focusedFoldPath)
+    ) {
+      return;
+    }
+    const nearest = this.cachedFoldTargets.find(
+      (target) => target.lineIndex >= this.scrollOffset,
+    );
+    this.focusedFoldPath = (nearest ?? this.cachedFoldTargets[0]!).foldPath;
+  }
+
+  private keepFocusedFoldInViewport(): void {
+    if (this.mode !== "provider" || this.cachedFoldTargets.length === 0) {
+      return;
+    }
+    const visible = this.visibleLineCount();
+    const current = this.cachedFoldTargets.find(
+      (target) => target.foldPath === this.focusedFoldPath,
+    );
+    if (
+      current &&
+      current.lineIndex >= this.scrollOffset &&
+      current.lineIndex < this.scrollOffset + visible
+    ) {
+      return;
+    }
+
+    const inViewport = this.cachedFoldTargets.find(
+      (target) =>
+        target.lineIndex >= this.scrollOffset &&
+        target.lineIndex < this.scrollOffset + visible,
+    );
+    if (inViewport) {
+      this.focusedFoldPath = inViewport.foldPath;
+      return;
+    }
+
+    // Deep inside an expanded block: focus its enclosing/preceding fold header.
+    for (let index = this.cachedFoldTargets.length - 1; index >= 0; index--) {
+      const candidate = this.cachedFoldTargets[index]!;
+      if (candidate.lineIndex <= this.scrollOffset) {
+        this.focusedFoldPath = candidate.foldPath;
+        return;
+      }
+    }
+    this.focusedFoldPath = this.cachedFoldTargets[0]!.foldPath;
+  }
+
+  private stepFoldFocus(direction: 1 | -1): void {
+    this.ensureWrappedLines(this.lastContentWidth);
+    const count = this.cachedFoldTargets.length;
+    if (count === 0) return;
+
+    const currentIndex = this.cachedFoldTargets.findIndex(
+      (target) => target.foldPath === this.focusedFoldPath,
+    );
+    const nextIndex =
+      currentIndex < 0
+        ? 0
+        : (currentIndex + direction + count) % count;
+    const nextTarget = this.cachedFoldTargets[nextIndex]!;
+    this.focusedFoldPath = nextTarget.foldPath;
+    this.lastJumpedSectionIndex = undefined;
+    this.revealLine(nextTarget.lineIndex);
+    this.tui.requestRender();
+  }
+
+  private toggleFocusedFold(): void {
+    this.ensureWrappedLines(this.lastContentWidth);
+    if (!this.focusedFoldPath) return;
+    this.toggleFoldPath(this.focusedFoldPath);
+    this.tui.requestRender();
+  }
+
+  private toggleFoldPath(foldPath: string): void {
+    this.ensureWrappedLines(this.lastContentWidth);
+    const beforeTarget = this.cachedFoldTargets.find(
+      (target) => target.foldPath === foldPath,
+    );
+    const relativeRow =
+      beforeTarget !== undefined
+        ? beforeTarget.lineIndex - this.scrollOffset
+        : undefined;
+
+    if (this.collapsedPaths.has(foldPath)) {
+      this.collapsedPaths.delete(foldPath);
+    } else {
+      this.collapsedPaths.add(foldPath);
+    }
+    this.foldVersion++;
+    this.focusedFoldPath = foldPath;
+    this.lastJumpedSectionIndex = undefined;
+    this.invalidateLines();
+    this.ensureWrappedLines(this.lastContentWidth);
+
+    const afterTarget = this.cachedFoldTargets.find(
+      (target) => target.foldPath === foldPath,
+    );
+    if (afterTarget) {
+      const visible = this.visibleLineCount();
+      const maxOffset = this.maxScrollOffset(visible);
+      if (
+        relativeRow !== undefined &&
+        relativeRow >= 0 &&
+        relativeRow < visible
+      ) {
+        this.scrollOffset = Math.max(
+          0,
+          Math.min(maxOffset, afterTarget.lineIndex - relativeRow),
+        );
+      } else {
+        this.revealLine(afterTarget.lineIndex);
+      }
+    }
+  }
+
+  private toggleExpandAll(): void {
+    if (!this.provider) return;
+    this.ensureWrappedLines(this.lastContentWidth);
+    if (this.cachedFoldTargets.length === 0 && this.collapsedPaths.size === 0) {
+      return;
+    }
+
+    const anchorPath = this.focusedFoldPath;
+    const beforeTarget = anchorPath
+      ? this.cachedFoldTargets.find((t) => t.foldPath === anchorPath)
+      : undefined;
+    const visible = this.visibleLineCount();
+    const relativeRow =
+      beforeTarget !== undefined &&
+      beforeTarget.lineIndex >= this.scrollOffset &&
+      beforeTarget.lineIndex < this.scrollOffset + visible
+        ? beforeTarget.lineIndex - this.scrollOffset
+        : undefined;
+
+    if (this.collapsedPaths.size > 0) {
+      this.collapsedPaths.clear();
+    } else {
+      this.collapsedPaths = collectSmartCollapsedPaths(
+        this.provider.payloadTree,
+      );
+    }
+    this.foldVersion++;
+    this.lastJumpedSectionIndex = undefined;
+    this.invalidateLines();
+    this.ensureWrappedLines(this.lastContentWidth);
+
+    if (anchorPath) {
+      const afterTarget = this.cachedFoldTargets.find(
+        (t) => t.foldPath === anchorPath,
+      );
+      if (afterTarget && relativeRow !== undefined) {
+        const maxOffset = this.maxScrollOffset(visible);
+        this.scrollOffset = Math.max(
+          0,
+          Math.min(maxOffset, afterTarget.lineIndex - relativeRow),
+        );
+      }
+    }
+    this.keepFocusedFoldInViewport();
+    this.tui.requestRender();
+  }
+
   private applySearchQuery(query: string, jumpToNearest: boolean): void {
     this.searchQuery = query;
+    this.ensureWrappedLines(this.lastContentWidth);
     this.recomputeSearchMatches(jumpToNearest);
   }
 
@@ -753,6 +1100,7 @@ class RequestFootprintViewer implements Component, Focusable {
       this.currentMatchIndex = nearest >= 0 ? nearest : 0;
       if (jumpToNearest) {
         this.revealLine(this.searchMatches[this.currentMatchIndex]!.lineIndex);
+        this.keepFocusedFoldInViewport();
       }
     } else {
       this.currentMatchIndex = Math.min(
@@ -767,19 +1115,74 @@ class RequestFootprintViewer implements Component, Focusable {
     const count = this.searchMatches.length;
     const base = this.currentMatchIndex < 0 ? 0 : this.currentMatchIndex;
     this.currentMatchIndex = (base + direction + count) % count;
+    this.lastJumpedSectionIndex = undefined;
     this.revealLine(this.searchMatches[this.currentMatchIndex]!.lineIndex);
+    this.keepFocusedFoldInViewport();
     this.tui.requestRender();
   }
 
-  private jumpToNextSection(): void {
-    if (this.cachedSectionLines.length === 0) return;
-    const next = this.cachedSectionLines.find(
-      (lineIndex) => lineIndex > this.scrollOffset,
-    );
-    const target = next ?? this.cachedSectionLines[0]!;
+  private jumpSection(direction: 1 | -1): void {
+    this.ensureWrappedLines(this.lastContentWidth);
+    const count = this.cachedSections.length;
+    if (count < 2) return;
+
     const maximumOffset = this.maxScrollOffset(this.visibleLineCount());
-    this.scrollOffset = Math.min(maximumOffset, target);
+    let targetIndex: number;
+
+    if (
+      this.lastJumpedSectionIndex !== undefined &&
+      this.lastJumpedSectionIndex < count
+    ) {
+      targetIndex = (this.lastJumpedSectionIndex + direction + count) % count;
+    } else if (direction === 1) {
+      const atScrollableBottom =
+        maximumOffset > 0 && this.scrollOffset >= maximumOffset;
+      const nextIndex = this.cachedSections.findIndex(
+        (section) =>
+          section.lineIndex > this.scrollOffset &&
+          (!atScrollableBottom || section.foldPath !== undefined),
+      );
+      targetIndex = nextIndex >= 0 ? nextIndex : 0;
+    } else {
+      let prevIndex = -1;
+      for (let index = count - 1; index >= 0; index--) {
+        if (this.cachedSections[index]!.lineIndex < this.scrollOffset) {
+          prevIndex = index;
+          break;
+        }
+      }
+      targetIndex = prevIndex >= 0 ? prevIndex : count - 1;
+    }
+
+    const target = this.cachedSections[targetIndex]!;
+    this.lastJumpedSectionIndex = targetIndex;
+    this.scrollOffset = Math.min(maximumOffset, target.lineIndex);
+    if (target.foldPath) {
+      this.focusedFoldPath = target.foldPath;
+    } else {
+      this.keepFocusedFoldInViewport();
+    }
     this.tui.requestRender();
+  }
+
+  private activeSection(): SectionTarget | undefined {
+    const count = this.cachedSections.length;
+    if (count === 0) return undefined;
+    if (
+      this.lastJumpedSectionIndex !== undefined &&
+      this.lastJumpedSectionIndex < count
+    ) {
+      return this.cachedSections[this.lastJumpedSectionIndex];
+    }
+    let active = this.cachedSections[0]!;
+    for (const section of this.cachedSections) {
+      if (section.lineIndex <= this.scrollOffset) {
+        active = section;
+      } else {
+        break;
+      }
+    }
+    return active;
   }
 
   private revealLine(lineIndex: number): void {
@@ -810,6 +1213,12 @@ class RequestFootprintViewer implements Component, Focusable {
 
   private buildTabBadge(): string {
     const parts: string[] = [];
+    if (this.cachedSections.length > 1) {
+      const current = this.activeSection();
+      if (current) {
+        parts.push(this.theme.fg("muted", `§ ${current.label}`));
+      }
+    }
     if (this.mode === "provider" && this.provider) {
       if (this.provider.response) {
         const status = this.provider.response.status;
@@ -891,11 +1300,25 @@ class RequestFootprintViewer implements Component, Focusable {
           : "copy";
 
     const hints: string[] = ["Tab/←→ view"];
-    if (this.cachedSectionLines.length > 1) hints.push("s section");
-    if (this.mode === "provider" && this.provider) hints.push("h headers");
+    if (this.cachedSections.length > 1) {
+      hints.push("s/S section");
+    }
+    if (
+      this.mode === "provider" &&
+      this.provider &&
+      (this.cachedFoldTargets.length > 0 || this.collapsedPaths.size > 0)
+    ) {
+      hints.push("[/] Enter fold");
+      hints.push(this.collapsedPaths.size > 0 ? "e expand" : "e collapse");
+    }
+    if (this.mode === "provider" && this.provider) {
+      hints.push("h headers");
+    }
     hints.push(this.searchQuery ? "/ search n/N" : "/ search");
     hints.push(`c ${copyLabel}`);
-    hints.push("↑↓/jk pgup/dn g/G");
+    if (this.mode === "system") {
+      hints.push("↑↓/jk pgup/dn g/G");
+    }
     hints.push("Esc/q");
 
     const left = ` ${this.theme.fg("dim", range)}`;
@@ -933,98 +1356,289 @@ class RequestFootprintViewer implements Component, Focusable {
   }
 }
 
-function wrapDocument(
-  text: string,
+interface BuiltDocument {
+  lines: WrappedLine[];
+  sections: SectionTarget[];
+  foldTargets: FoldTarget[];
+}
+
+function buildSystemDocument(
+  systemPrompt: string,
+  promptAnalysis: SystemPromptAnalysis,
+  toolsTree: StructuredNode,
   width: number,
-  headings: readonly string[],
-  defaultStructured: boolean,
-): WrappedLine[] {
-  const headingSet = new Set(headings);
-  const rawLines = text.split("\n");
-  const result: WrappedLine[] = [];
+): BuiltDocument {
+  const lines: WrappedLine[] = [];
+  const sections: SectionTarget[] = [];
 
-  let inStructuredSection = defaultStructured;
-  let inMultiline = false;
+  sections.push({ lineIndex: lines.length, label: "System Prompt" });
+  pushHeadingWithRule(lines, "System Prompt", width);
 
-  for (let index = 0; index < rawLines.length; index++) {
-    const sanitized = sanitizeLine(rawLines[index]!);
-    const nextSanitized =
-      index + 1 < rawLines.length ? sanitizeLine(rawLines[index + 1]!) : "";
-    const trimmed = sanitized.trim();
-
-    let kind: LineKind;
-    if (
-      !inMultiline &&
-      headingSet.has(sanitized) &&
-      nextSanitized === "─".repeat(sanitized.length)
-    ) {
-      kind = "heading";
-      inStructuredSection = sanitized !== "System Prompt";
-    } else if (
-      !inMultiline &&
-      index > 0 &&
-      headingSet.has(sanitizeLine(rawLines[index - 1]!)) &&
-      sanitized === "─".repeat(sanitizeLine(rawLines[index - 1]!).length)
-    ) {
-      kind = "rule";
-    } else if (
-      !inMultiline &&
-      inStructuredSection &&
-      (trimmed === MULTILINE_START ||
-        trimmed.endsWith(`: ${MULTILINE_START}`))
-    ) {
-      kind = trimmed === MULTILINE_START ? "delimiter" : "structured";
-      inMultiline = true;
-    } else if (
-      inMultiline &&
-      (trimmed === MULTILINE_END || trimmed === `${MULTILINE_END},`)
-    ) {
-      kind = trimmed === MULTILINE_END ? "delimiter" : "structured";
-      inMultiline = false;
-    } else if (inMultiline) {
-      kind = "plain";
-    } else {
-      kind = inStructuredSection ? "structured" : "plain";
-    }
-
-    const wrapped = wrapTextWithAnsi(sanitized, width);
-    if (wrapped.length === 0) {
-      result.push({ text: "", kind });
-    } else {
-      for (const piece of wrapped) {
-        result.push({ text: piece, kind });
-      }
-    }
+  const landmarkByLine = new Map<number, string>();
+  for (const landmark of promptAnalysis.landmarks) {
+    landmarkByLine.set(landmark.lineIndex, landmark.label);
   }
 
-  return result;
+  const promptRawLines = systemPrompt.split("\n");
+  for (let rawIndex = 0; rawIndex < promptRawLines.length; rawIndex++) {
+    const landmarkLabel = landmarkByLine.get(rawIndex);
+    if (landmarkLabel !== undefined) {
+      sections.push({ lineIndex: lines.length, label: landmarkLabel });
+    }
+
+    const tagKind = promptAnalysis.taggedLines.get(rawIndex);
+    const kind: LineKind =
+      tagKind === "xml-open"
+        ? "xml-open"
+        : tagKind === "xml-close"
+          ? "xml-close"
+          : tagKind === "xml-inline"
+            ? "xml-inline"
+            : tagKind === "markdown-heading"
+              ? "md-heading"
+              : "plain";
+
+    pushWrappedLine(lines, sanitizeLine(promptRawLines[rawIndex]!), kind, width);
+  }
+
+  lines.push({ text: "", kind: "plain" });
+
+  sections.push({ lineIndex: lines.length, label: "Tools" });
+  pushHeadingWithRule(lines, "Tools", width);
+
+  const toolLines = renderStructuredTree(toolsTree, EMPTY_COLLAPSED_SET);
+  for (const sLine of toolLines) {
+    const kind: LineKind = sLine.inMultilineBody ? "plain" : "structured";
+    pushWrappedLine(lines, sanitizeLine(sLine.text), kind, width);
+  }
+
+  return { lines, sections, foldTargets: [] };
+}
+
+function buildProviderDocument(
+  provider: ProviderSnapshot | undefined,
+  headersTree: StructuredNode | undefined,
+  fallbackText: string,
+  showHeaders: boolean,
+  collapsedPaths: ReadonlySet<string>,
+  width: number,
+): BuiltDocument {
+  const lines: WrappedLine[] = [];
+  const sections: SectionTarget[] = [];
+  const foldTargets: FoldTarget[] = [];
+
+  if (!provider) {
+    for (const raw of fallbackText.split("\n")) {
+      pushWrappedLine(lines, sanitizeLine(raw), "plain", width);
+    }
+    return { lines, sections, foldTargets };
+  }
+
+  if (showHeaders) {
+    sections.push({ lineIndex: lines.length, label: "Request Headers" });
+    pushHeadingWithRule(lines, "Request Headers (redacted)", width);
+    if (headersTree) {
+      for (const sLine of renderStructuredTree(headersTree, EMPTY_COLLAPSED_SET)) {
+        const kind: LineKind = sLine.inMultilineBody ? "plain" : "structured";
+        pushWrappedLine(lines, sanitizeLine(sLine.text), kind, width);
+      }
+    } else {
+      pushWrappedLine(
+        lines,
+        "Not exposed by this provider/transport.",
+        "plain",
+        width,
+      );
+    }
+    lines.push({ text: "", kind: "plain" });
+
+    sections.push({ lineIndex: lines.length, label: "HTTP Response" });
+    pushHeadingWithRule(lines, "Latest HTTP Response", width);
+    if (provider.response) {
+      const responseTree = buildStructuredTree({
+        status: provider.response.status,
+        responsesObserved: provider.response.responseCount,
+        headers: provider.response.headers,
+      });
+      for (const sLine of renderStructuredTree(responseTree, EMPTY_COLLAPSED_SET)) {
+        const kind: LineKind = sLine.inMultilineBody ? "plain" : "structured";
+        pushWrappedLine(lines, sanitizeLine(sLine.text), kind, width);
+      }
+    } else {
+      pushWrappedLine(
+        lines,
+        "No HTTP response observed yet for this request.",
+        "plain",
+        width,
+      );
+    }
+    lines.push({ text: "", kind: "plain" });
+
+    sections.push({ lineIndex: lines.length, label: "Payload" });
+    pushHeadingWithRule(lines, "Payload", width);
+  } else {
+    sections.push({ lineIndex: 0, label: "Payload" });
+  }
+
+  const payloadLines = renderStructuredTree(
+    provider.payloadTree,
+    collapsedPaths,
+  );
+  pushFoldableStructuredLines(
+    lines,
+    sections,
+    foldTargets,
+    payloadLines,
+    width,
+  );
+
+  return { lines, sections, foldTargets };
+}
+
+function pushHeadingWithRule(
+  lines: WrappedLine[],
+  heading: string,
+  width: number,
+): void {
+  pushWrappedLine(lines, heading, "heading", width);
+  pushWrappedLine(lines, "─".repeat(heading.length), "rule", width);
+}
+
+function pushWrappedLine(
+  lines: WrappedLine[],
+  sanitized: string,
+  kind: LineKind,
+  width: number,
+): void {
+  const wrapped = wrapTextWithAnsi(sanitized, width);
+  if (wrapped.length === 0) {
+    lines.push({ text: "", kind });
+    return;
+  }
+  for (const piece of wrapped) {
+    lines.push({ text: piece, kind });
+  }
+}
+
+function pushFoldableStructuredLines(
+  lines: WrappedLine[],
+  sections: SectionTarget[],
+  foldTargets: FoldTarget[],
+  structuredLines: readonly StructuredDisplayLine[],
+  width: number,
+): void {
+  for (const sLine of structuredLines) {
+    const firstLineIndex = lines.length;
+    if (sLine.topLevelKey !== undefined) {
+      sections.push({
+        lineIndex: firstLineIndex,
+        label: sLine.topLevelKey,
+        foldPath: sLine.foldPath,
+      });
+    }
+    if (sLine.foldPath !== undefined) {
+      foldTargets.push({
+        lineIndex: firstLineIndex,
+        foldPath: sLine.foldPath,
+        collapsed: Boolean(sLine.collapsed),
+      });
+    }
+
+    const sanitized = sanitizeLine(sLine.text);
+    const kind: LineKind = sLine.inMultilineBody ? "plain" : "structured";
+    const wrapped = wrapTextWithAnsi(sanitized, width);
+    if (wrapped.length === 0) {
+      lines.push({
+        text: "",
+        kind,
+        foldPath: sLine.foldPath,
+        collapsed: sLine.collapsed,
+        showFoldMarker: sLine.foldPath !== undefined,
+      });
+      continue;
+    }
+
+    wrapped.forEach((piece, pieceIndex) => {
+      lines.push({
+        text: piece,
+        kind,
+        foldPath: sLine.foldPath,
+        collapsed: sLine.collapsed,
+        showFoldMarker: pieceIndex === 0 && sLine.foldPath !== undefined,
+      });
+    });
+  }
 }
 
 function sanitizeLine(line: string): string {
   return replaceControlCharacters(line.replaceAll("\t", "  "));
 }
 
-function tokenizeLine(line: WrappedLine): StyledSegment[] {
+function tokenizeLine(
+  line: WrappedLine,
+  isFocusedFold: boolean,
+): StyledSegment[] {
   const { text, kind } = line;
   if (!text) return [];
   if (kind === "heading") return [{ text, role: "heading" }];
   if (kind === "rule") return [{ text, role: "rule" }];
-  if (kind === "delimiter") return [{ text, role: "delimiter" }];
+  if (kind === "xml-open" || kind === "xml-close" || kind === "md-heading") {
+    return [{ text, role: "sectionTag" }];
+  }
+  if (kind === "xml-inline") {
+    return tokenizeInlineXmlLine(text);
+  }
   if (kind === "plain") return [{ text }];
 
-  return tokenizeStructuredLine(text);
+  return tokenizeStructuredLine(line, isFocusedFold);
 }
 
-function tokenizeStructuredLine(text: string): StyledSegment[] {
+function tokenizeInlineXmlLine(text: string): StyledSegment[] {
+  const segments: StyledSegment[] = [];
+  let cursor = 0;
+
+  const openMatch = INLINE_OPEN_TAG_PREFIX_RE.exec(text);
+  if (openMatch) {
+    segments.push({ text: openMatch[0], role: "sectionTag" });
+    cursor = openMatch[0].length;
+  }
+
+  const remainder = text.slice(cursor);
+  const closeMatch = INLINE_CLOSE_TAG_SUFFIX_RE.exec(remainder);
+  if (closeMatch && closeMatch.index >= 0) {
+    const middle = remainder.slice(0, closeMatch.index);
+    if (middle) segments.push({ text: middle });
+    segments.push({ text: closeMatch[0], role: "sectionTag" });
+  } else if (remainder) {
+    segments.push({ text: remainder });
+  }
+
+  return segments;
+}
+
+function tokenizeStructuredLine(
+  line: WrappedLine,
+  isFocusedFold: boolean,
+): StyledSegment[] {
+  const { text } = line;
   const segments: StyledSegment[] = [];
   const push = (chunk: string, role?: StyledSegment["role"]) => {
     if (chunk) segments.push({ text: chunk, role });
+  };
+  const pushIndent = (leading: string) => {
+    if (line.showFoldMarker && leading.length >= 2) {
+      push(leading.slice(0, -2));
+      push(line.collapsed ? "▸" : "▾", isFocusedFold ? "foldActive" : "fold");
+      push(" ");
+    } else {
+      push(leading);
+    }
   };
 
   // Match indented `"key": <rest>`
   const keyMatch = /^(\s*)("(?:\\.|[^"\\])*")(: )(.*)$/.exec(text);
   if (keyMatch) {
-    push(keyMatch[1]!);
+    pushIndent(keyMatch[1]!);
     push(keyMatch[2]!, "key");
     push(keyMatch[3]!, "punctuation");
     pushStructuredValue(keyMatch[4]!, push);
@@ -1033,7 +1647,7 @@ function tokenizeStructuredLine(text: string): StyledSegment[] {
 
   const trimmedMatch = /^(\s*)(.*)$/.exec(text);
   if (trimmedMatch) {
-    push(trimmedMatch[1]!);
+    pushIndent(trimmedMatch[1]!);
     pushStructuredValue(trimmedMatch[2]!, push);
     return segments;
   }
@@ -1049,8 +1663,20 @@ function pushStructuredValue(
   const trailingComma = valueText.endsWith(",");
   const core = trailingComma ? valueText.slice(0, -1) : valueText;
 
-  if (core === MULTILINE_START || core === MULTILINE_END) {
+  if (
+    core === MULTILINE_START ||
+    core === MULTILINE_END ||
+    core === MULTILINE_COLLAPSED
+  ) {
     push(core, "delimiter");
+  } else if (core === OBJECT_COLLAPSED) {
+    push("{", "punctuation");
+    push(" … ", "delimiter");
+    push("}", "punctuation");
+  } else if (core === ARRAY_COLLAPSED) {
+    push("[", "punctuation");
+    push(" … ", "delimiter");
+    push("]", "punctuation");
   } else if (
     core === "{" ||
     core === "}" ||
@@ -1082,11 +1708,12 @@ function pushStructuredValue(
 
 function renderStyledLine(
   line: WrappedLine,
+  isFocusedFold: boolean,
   lineMatches: readonly SearchMatch[],
   activeMatch: SearchMatch | undefined,
   theme: Theme,
 ): string {
-  const segments = tokenizeLine(line);
+  const segments = tokenizeLine(line, isFocusedFold);
   if (segments.length === 0) return "";
 
   if (lineMatches.length === 0) {
@@ -1160,10 +1787,16 @@ function styleSegment(
   switch (role) {
     case "heading":
       return theme.fg("mdHeading", theme.bold(text));
+    case "sectionTag":
+      return theme.fg("mdHeading", text);
     case "rule":
       return theme.fg("mdHr", text);
     case "delimiter":
       return theme.fg("dim", text);
+    case "fold":
+      return theme.fg("muted", text);
+    case "foldActive":
+      return theme.fg("accent", theme.bold(text));
     case "key":
       return theme.fg("syntaxVariable", text);
     case "string":

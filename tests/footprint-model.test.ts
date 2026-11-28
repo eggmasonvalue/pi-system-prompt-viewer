@@ -1,15 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ARRAY_COLLAPSED,
+  analyzeSystemPrompt,
+  buildStructuredTree,
+  collectMatchingFoldPaths,
+  collectSmartCollapsedPaths,
   filterVisibleTools,
   findSearchMatches,
   findSectionLines,
+  MULTILINE_COLLAPSED,
+  OBJECT_COLLAPSED,
   PROVIDER_DIAGNOSTICS_HEADINGS,
   parseViewerCommandMode,
   redactHeaders,
   renderProviderDiagnostics,
   renderProviderNeutralContent,
   renderStructured,
+  renderStructuredTree,
   SYSTEM_SECTION_HEADINGS,
   serializeProviderPayload,
   toProviderNeutralTool,
@@ -247,3 +255,167 @@ test("parseViewerCommandMode parses empty, system, provider, and rejects unknown
   assert.equal(parseViewerCommandMode("  Provider "), "provider");
   assert.equal(parseViewerCommandMode("other"), undefined);
 });
+
+test("analyzeSystemPrompt extracts top-level XML blocks while skipping nested tags, fences, and unclosed tags", () => {
+  const prompt = [
+    "You are a coding assistant.",
+    "",
+    "<tools>",
+    "- read: Read file contents",
+    "</tools>",
+    "",
+    "<unclosed_placeholder>",
+    "Still top-level prose.",
+    "",
+    "<project_context>",
+    "<project_instructions path=\"AGENTS.md\">",
+    "# Nested Heading Inside XML",
+    "```xml",
+    "</project_context>",
+    "<fake_section>",
+    "</fake_section>",
+    "```",
+    "</project_instructions>",
+    "</project_context>",
+    "",
+    "<skills>",
+    "  <available_skills>",
+    "    <skill><name>demo</name></skill>",
+    "  </available_skills>",
+    "</skills>",
+    "",
+    "<cwd>/workspace/demo</cwd>",
+  ].join("\n");
+
+  const analysis = analyzeSystemPrompt(prompt);
+  assert.deepEqual(
+    analysis.landmarks.map((item) => item.label),
+    ["<tools>", "<project_context>", "<skills>", "<cwd>"],
+  );
+  assert.equal(analysis.taggedLines.get(2), "xml-open");
+  assert.equal(analysis.taggedLines.get(4), "xml-close");
+  assert.equal(analysis.taggedLines.get(26), "xml-inline");
+});
+
+test("analyzeSystemPrompt supports top-level Markdown headings outside XML and code fences", () => {
+  const prompt = [
+    "# Role",
+    "General instructions.",
+    "```md",
+    "## Fenced Heading",
+    "```",
+    "## Constraints",
+    "Be concise.",
+  ].join("\n");
+
+  const analysis = analyzeSystemPrompt(prompt);
+  assert.deepEqual(
+    analysis.landmarks.map((item) => item.label),
+    ["# Role", "## Constraints"],
+  );
+});
+
+test("smart-collapsed structured rendering uses pure delimiters with zero fabricated preview text", () => {
+  const longOutput = Array.from(
+    { length: 12 },
+    (_, i) => `output line ${i + 1}`,
+  ).join("\n");
+  const payload = {
+    model: "claude-sonnet-4",
+    max_tokens: 8192,
+    emptyObj: {},
+    emptyArr: [],
+    thinking: { type: "enabled", budget_tokens: 2048 },
+    system: "system line one\nsystem line two",
+    messages: [
+      { role: "user", content: "short line 1\nshort line 2" },
+      { role: "tool", content: longOutput },
+    ],
+    tools: [
+      {
+        name: "secretToolName",
+        description: "secret tool description",
+        input_schema: { type: "object" },
+      },
+    ],
+    stream: true,
+  };
+
+  const tree = buildStructuredTree(payload);
+  const smartCollapsed = collectSmartCollapsedPaths(tree);
+  const initialLines = renderStructuredTree(tree, smartCollapsed);
+  const initialText = initialLines.map((line) => line.text).join("\n");
+
+  // Top-level scalars and empty containers stay verbatim; foldable sections use pure delimiters.
+  assert.ok(initialText.includes('"model": "claude-sonnet-4",'));
+  assert.ok(initialText.includes('"emptyObj": {},'));
+  assert.ok(initialText.includes('"emptyArr": [],'));
+  assert.ok(initialText.includes(`"thinking": ${OBJECT_COLLAPSED},`));
+  assert.ok(initialText.includes(`"system": ${MULTILINE_COLLAPSED},`));
+  assert.ok(initialText.includes(`"messages": ${ARRAY_COLLAPSED},`));
+  assert.ok(initialText.includes(`"tools": ${ARRAY_COLLAPSED},`));
+
+  // Zero inner payload values or synthesized previews appear while collapsed.
+  for (const hidden of [
+    "budget_tokens",
+    "system line one",
+    "short line 1",
+    "output line 1",
+    "secretToolName",
+    "secret tool description",
+  ]) {
+    assert.equal(initialText.includes(hidden), false, `leaked: ${hidden}`);
+  }
+
+  // Top-level foldable keys are marked as section targets.
+  const sectionKeys = initialLines
+    .filter((line) => line.topLevelKey !== undefined)
+    .map((line) => line.topLevelKey);
+  assert.deepEqual(sectionKeys, ["thinking", "system", "messages", "tools"]);
+
+  // Expanding `messages` reveals collapsed item shells `{ … }` without dumping inner lines.
+  const afterMessagesOpen = new Set(smartCollapsed);
+  afterMessagesOpen.delete('$."messages"');
+  const messagesLines = renderStructuredTree(tree, afterMessagesOpen)
+    .map((line) => line.text)
+    .join("\n");
+  assert.ok(messagesLines.includes(`    ${OBJECT_COLLAPSED},`));
+  assert.equal(messagesLines.includes("short line 1"), false);
+
+  // Expanding the second message shows its role while keeping the 12-line output folded.
+  afterMessagesOpen.delete('$."messages"[1]');
+  const messageTwoText = renderStructuredTree(tree, afterMessagesOpen)
+    .map((line) => line.text)
+    .join("\n");
+  assert.ok(messageTwoText.includes('"role": "tool",'));
+  assert.ok(messageTwoText.includes(`"content": ${MULTILINE_COLLAPSED}`));
+  assert.equal(messageTwoText.includes("output line 1"), false);
+
+  // Expanding everything matches `renderStructured(payload)` byte-for-byte.
+  const fullyExpanded = renderStructuredTree(tree, new Set())
+    .map((line) => line.text)
+    .join("\n");
+  assert.equal(fullyExpanded, renderStructured(payload));
+});
+
+test("collectMatchingFoldPaths reveals only ancestor branches containing search matches", () => {
+  const tree = buildStructuredTree({
+    thinking: { type: "enabled", budget_tokens: 2048 },
+    messages: [
+      { role: "user", content: "unrelated turn" },
+      { role: "assistant", content: "contains needle_token here\non line two" },
+    ],
+    tools: [{ name: "read", description: "read files" }],
+  });
+
+  const matched = collectMatchingFoldPaths(tree, "NEEDLE_TOKEN");
+  assert.deepEqual(
+    [...matched].sort(),
+    ['$."messages"', '$."messages"[1]', '$."messages"[1]."content"'].sort(),
+  );
+
+  // Searching a top-level key visible on its own collapsed line does not force-open its body.
+  const keyOnly = collectMatchingFoldPaths(tree, "thinking");
+  assert.equal(keyOnly.has('$."thinking"'), false);
+});
+

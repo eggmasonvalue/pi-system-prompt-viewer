@@ -27,7 +27,9 @@ Tab-completion suggests `system` and `provider`.
 | `↑↓` / `j` `k` or mouse wheel   | Scroll one line (or wheel step in fullscreen mode)                  |
 | `PgUp` / `PgDn` / `u` `d` `Spc` | Scroll one page                                                     |
 | `Home` / `End` / `g` `G`        | Jump to the top or bottom                                           |
-| `s`                             | Jump to the next section (`System Prompt` ↔ `Tools`, etc.)          |
+| `s` / `S`                       | Jump to the next / previous section (top-level XML/Markdown blocks, `Tools`, payload keys) |
+| `[` `]` + `Enter`, or click `▸` | Focus and expand/collapse a folded node (Provider view)             |
+| `e`                             | Expand all or restore smart-collapsed view (Provider view)          |
 | `h`                             | Toggle redacted HTTP request/response headers (Provider view)       |
 | `/` then `Enter` / `Esc`        | Search within the active view                                       |
 | `n` / `N`                       | Jump to the next / previous search match                            |
@@ -54,6 +56,8 @@ During an agent run, the System Footprint updates on every LLM call via `context
 ### Provider Request
 
 This secondary view captures the complete `event.payload` from `before_provider_request`. It is not filtered: provider-converted tools, full messages/conversation, provider-specific system fields, schemas, and other payload fields remain present. A structural renderer keeps object and array boundaries visible while rendering every multiline string as actual terminal lines instead of a wall of literal `\\n` escapes, with theme-aware syntax coloring on screen. It does not deduplicate, rewrite, or remove repeated values.
+
+To keep large payloads navigable, the Provider Request opens smart-collapsed using pure structural delimiters (`{ … }`, `[ … ]`, `<<< multiline string … >>>`) with zero synthesized preview text. Click any `▸` / `▾` line, use `[` / `]` + `Enter` to toggle individual branches, or press `e` to expand everything at once. Searching (`/`) automatically unfolds matching branches so hidden text is never missed.
 
 When Pi's transport exposes `before_provider_headers` and `after_provider_response`, the overlay shows the latest HTTP status badge and lets you press `h` to toggle redacted request headers and latest response metadata above the payload. Credential and auth headers (`Authorization`, `x-api-key`, `Cookie`, etc.) are automatically replaced with `[REDACTED]`.
 
